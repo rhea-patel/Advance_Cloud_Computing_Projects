@@ -1,0 +1,25 @@
+services:
+  container1:
+    image: riyapatel30/app1
+    container_name: container1
+    ports:
+      - "6000:6000"
+    volumes:
+      - ./:/mountedVolume
+    networks:
+      - myNetwork
+    restart: always
+
+  application2:
+    image: riyapatel30/app2
+    container_name: container2
+    volumes:
+      - ./:/mountedVolume
+    networks:
+      - myNetwork
+    restart: always
+
+networks:
+  myNetwork:
+    driver: bridge
+    attachable: true
