@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "My API with Lambda, s3, SNS, and Backup"
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - m3.medium
+    - m3.large
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+Resources:
+
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: weatheralertdata
+
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "My SNS Topic"
+      TopicName: CSCI5409_SNS1
+
+  # Create the 'getDetails' Lambda function.
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getDetails
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::803954828614:role/LabRole
+      Timeout: 30
+      Code:
+        S3Bucket: "csci5409lambdacode"
+        S3Key: lambda_fucntion.zip
+      Environment:
+        Variables:
+          SnsTopicArn: !Ref MySNSTopic
+
+  MyLambdaFunctionWeatherAlert:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: weatherAlertLambda
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: arn:aws:iam::803954828614:role/LabRole
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              # Parse the body of the incoming event
+              if 'body' in event:
+                  request_body = json.loads(event['body'])
+              else:
+                  request_body = event
+
+              email = request_body['email']
+              location = request_body['location']
+
+              # Initialize the AWS S3 and SNS services
+              s3 = boto3.client("s3")
+              sns = boto3.client("sns", region_name="us-east-1")  # Replace with your actual AWS region
+              sns_topic_arn = os.environ['TopicArn']
+
+              # S3 get object parameters
+              s3_params = {
+                  "Bucket": "weatheralertdata",  # Replace with your actual S3 bucket name
+                  "Key": f"{location}.json",  # Use the location as the filename
+              }
+
+              try:
+                  # Fetch the location data from S3
+                  s3_response = s3.get_object(**s3_params)
+                  location_data = json.loads(s3_response["Body"].read().decode("utf-8"))
+
+                  # Check if the email is already subscribed to the SNS topic
+                  subscriptions = sns.list_subscriptions_by_topic(TopicArn=sns_topic_arn)
+                  subscribed_emails = [sub["Endpoint"] for sub in subscriptions["Subscriptions"]]
+
+                  if email not in subscribed_emails:
+                      # Subscribe the email to the SNS topic
+                      sns.subscribe(TopicArn=sns_topic_arn, Protocol="email", Endpoint=email)
+
+                  # Compose the message to be sent via email
+                  message = f"Location: {location_data['location']}\n"
+                  message += f"Temperature: {location_data['temperature']}°F\n"
+                  message += f"Description: {location_data['description']}\n"
+                  message += f"Feels Like: {location_data['feelsLike']}°F\n"
+                  message += f"Humidity: {location_data['humidity']}%\n"
+                  message += f"Wind Speed: {location_data['windSpeed']} MPH\n"
+
+                  # Specify the params for SNS publish
+                  params = {
+                      "Message": message,
+                      "Subject": f"Weather Information for {location}",
+                      "TopicArn": sns_topic_arn,
+                  }
+
+                  # Call the SNS publish method to send the email notification
+                  sns.publish(**params)
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "message": "Weather information sent to your email.",
+                      }),
+                  }
+
+              except Exception as e:
+                  print(e)
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({
+                          "message": "An error occurred. Please try again.",
+                      }),
+                  }
+          # Add your Lambda function code here
+      Environment:
+        Variables:
+          TopicArn: !Ref MySNSTopic # Use the SNS topic ARN created earlier
+          S3Bucket: "weatheralertdata" # Replace with your actual S3 bucket name
+
+  MyRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CSCI5409_MyApiGateway
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+
+  # Create an API Gateway resource named 'MyApiResource' under the specified 'MyRestApi'.
+  # This resource will serve as a parent resource for the API method we are going to create.
+  # The 'PathPart' property defines the path part of the resource's URL, 'cloud-resource'.
+  MyApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyRestApi
+      ParentId: !GetAtt MyRestApi.RootResourceId
+      PathPart: cloud-resource
+
+  # Create an API Gateway method named 'MyApiMethod' under the 'MyApiResource'.
+  # This method handles HTTP POST requests and has no authorization requirements.
+  # It is integrated with an AWS Lambda function ('MyLambdaFunction') using the Lambda proxy integration.
+  # The 'IntegrationResponses' section defines how API Gateway responds to the integration request.
+  MyApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyRestApi
+      ResourceId: !Ref MyApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunction.Arn}/invocations"
+        IntegrationResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+            "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+            "method.response.header.Access-Control-Allow-Origin": "'*'"
+      MethodResponses:
+      - StatusCode: "200"
+        ResponseParameters:
+          "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+          "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+          "method.response.header.Access-Control-Allow-Origin": "'*'"
+      - StatusCode: "400"
+
+  MyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyRestApi
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ResourceId: !Ref MyApiResource
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+        IntegrationResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+            "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+            "method.response.header.Access-Control-Allow-Origin": "'*'"
+        - StatusCode: "400"
+      MethodResponses:
+      - StatusCode: "200"
+        ResponseParameters:
+          "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+          "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+          "method.response.header.Access-Control-Allow-Origin": "'*'"
+
+  # Create an API Gateway resource named 'MyApiResourceWeatherAlert' for weather alerts.
+  MyRestApi1:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CSCI5409_MyApiGateway1
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+
+  MyApiResourceWeatherAlert:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyRestApi1
+      ParentId: !GetAtt MyRestApi1.RootResourceId
+      PathPart: cloud-resource-weather-alert
+
+  # Create an API Gateway method named 'MyApiMethodWeatherAlert' for weather alerts.
+  MyApiMethodWeatherAlert:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyRestApi1
+      ResourceId: !Ref MyApiResourceWeatherAlert
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunctionWeatherAlert.Arn}/invocations"
+        IntegrationResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+            "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+            "method.response.header.Access-Control-Allow-Origin": "'*'"
+      MethodResponses:
+      - StatusCode: "200"
+        ResponseParameters:
+          "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+          "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+          "method.response.header.Access-Control-Allow-Origin": "'*'"
+      - StatusCode: "500"
+
+  MyOptionsMethodWeatherAlert:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyRestApi1
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ResourceId: !Ref MyApiResourceWeatherAlert
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          "application/json": '{"statusCode": 200}'
+        IntegrationResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+            "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+            "method.response.header.Access-Control-Allow-Origin": "'*'"
+        - StatusCode: "400"
+      MethodResponses:
+      - StatusCode: "200"
+        ResponseParameters:
+          "method.response.header.Access-Control-Allow-Headers": "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+          "method.response.header.Access-Control-Allow-Methods": "'POST,OPTIONS'"
+          "method.response.header.Access-Control-Allow-Origin": "'*'"
+
+  # Create an API Gateway deployment named 'MyDeployment'.
+  # The deployment is dependent on the creation of 'MyApiMethod', 'MyApiMethodWeatherAlert'.
+  # It deploys the API configuration to the 'prod' stage of the API.
+  MyDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - MyApiMethod
+    Properties:
+      RestApiId: !Ref MyRestApi
+      StageName: "prod"
+
+  MyDeployment1:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - MyApiMethodWeatherAlert
+    Properties:
+      RestApiId: !Ref MyRestApi1
+      StageName: "prod1"
+
+  # Create permissions for the Lambda functions to be invoked by API Gateway.
+  MyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MyLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyRestApi}/*/POST/cloud-resource"
+
+  MyLambdaPermissionWeatherAlert:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MyLambdaFunctionWeatherAlert
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyRestApi1}/*/POST/cloud-resource-weather-alert"
+
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-05548f9cecf47b442
+      KeyName: riyap
+      SecurityGroups:
+      - !Ref InstanceSecurityGroup
+      Tags:
+      - Key: Name
+        Value: CSCI5409_EC2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install -y aws-cli
+          sudo yum install -y git
+          git clone https://github.com/testriya/termassignment5409.git /home/ec2-user/termassignment5409
+          sudo yum install -y nodejs
+          cd /home/ec2-user/termassignment5409
+
+          echo "REACT_APP_API_ENDPOINT_1=https://${MyRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/cloud-resource" > /home/ec2-user/termassignment5409/.env
+          echo "REACT_APP_API_ENDPOINT_2=https://${MyRestApi1}.execute-api.${AWS::Region}.amazonaws.com/prod1/cloud-resource-weather-alert" >> /home/ec2-user/termassignment5409/.env
+
+          npm install
+          npm install dotenv
+          npm start
+
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for the EC2 instance
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 6000
+        CidrIp: 0.0.0.0/0
+
+  MyBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: "MyBackupVault"
+
+  MyBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: "MyBackupPlan"
+        BackupPlanRule:
+        - RuleName: "MyBackupRule"
+          TargetBackupVault: !Ref MyBackupVault
+          ScheduleExpression: "cron(0 12 * * ? *)" # Backup daily at noon UTC
+          StartWindowMinutes: 60
+          CompletionWindowMinutes: 10080 # 7 days
+          Lifecycle:
+            DeleteAfterDays: 30 # Delete backups after 30 days
+
+
+
+
+
+Outputs:
+  SNSTopicArn:
+    Description: "ARN of the created SNS topic"
+    Value: !Ref MySNSTopic
+    Export:
+      Name: "MySNSTopicArn"
+
+  BackupPlanId:
+    Description: "Backup Plan ID"
+    Value: !Ref MyBackupPlan
